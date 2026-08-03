@@ -186,7 +186,6 @@ Worth knowing before you rely on it:
 - **Signature checking is macOS-first.** osquery's `signature` table joins cleanly with `apps`; the Windows equivalent needs a reliable executable path that the uninstall registry often does not provide.
 - **Inventory freshness is your fleet's, not ours.** If osquery reports daily, a package installed an hour ago will not appear until the next collection.
 - **A machine reporting nothing looks like a machine that is switched off.** Hosts with no inventory are skipped and counted, never treated as "everything uninstalled" — but fleetdrift cannot tell you *why* a host went quiet.
-- **GitHub Actions are pinned to version tags, not SHAs.** Tracked as an open issue.
 
 ## Contributing
 

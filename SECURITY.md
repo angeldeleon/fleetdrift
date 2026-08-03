@@ -40,7 +40,7 @@ fleetdrift runs on a management host with credentials for a fleet manager, netwo
 - CI runs `pip-audit` on every push and weekly.
 - Workflow `permissions` default to `contents: read`; jobs opt in to more.
 - Dependabot is enabled for pip and GitHub Actions.
-- Actions are currently pinned to **major version tags**, not commit SHAs. Tags are mutable, so this is weaker than SHA pinning; moving to SHAs is tracked as an open issue and is a welcome contribution.
+- Actions are pinned to **full commit SHAs**, with the version tag kept in a trailing comment so Dependabot can still propose updates. A tag is mutable and can be repointed at malicious code by anyone who compromises the action's repository; a SHA cannot.
 
 ## Running it safely
 
