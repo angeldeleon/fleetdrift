@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so dependency advisories surface even when nothing is pushed.
+    - cron: "23 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test
+        run: pytest -m "not network" --cov --cov-report=term-missing
+
+  lint:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Ruff (lint)
+        run: ruff check --output-format=github .
+      - name: Ruff (format)
+        run: ruff format --check .
+      - name: mypy
+        run: mypy
+
+  security:
+    name: security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Bandit
+        run: bandit -r src/ -c pyproject.toml
+      - name: pip-audit
+        # Audit the project's declared dependencies, not the installed
+        # environment: the latter contains fleetdrift itself as an editable
+        # install, which pip-audit cannot resolve on PyPI, and --strict treats
+        # an unauditable package as a hard failure.
+        run: pip-audit --strict --desc on .
+
+  invariants:
+    name: security invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: The query pack reads only software inventory
+        # A guard against a future PR quietly widening what gets collected on
+        # every employee's machine. PRIVACY.md makes a promise; this enforces it.
+        run: |
+          set -euo pipefail
+          fleetdrift pack --explain > pack.txt
+          for forbidden in "FROM file" "FROM users" "shell_history" "process_events" "carve" "SELECT *"; do
+            if grep -qi -- "$forbidden" pack.txt; then
+              echo "::error::query pack references '$forbidden'"; exit 1
+            fi
+          done
+          echo "query pack is clean"
+
+      - name: Config cannot supply a query
+        run: |
+          set -euo pipefail
+          printf 'source:\n  type: resultlog\n  resultlog:\n    path: /tmp/x.log\n    query: "SELECT * FROM file"\n' > bad.yml
+          if fleetdrift validate -c bad.yml 2>/dev/null; then
+            echo "::error::config accepted a query key"; exit 1
+          fi
+          echo "config rejects query keys"
+
+      - name: The example config validates offline
+        run: fleetdrift validate -c fleet.example.yml
+
+      - name: Every declared check is actually consumed
+        # `eol` was in ALL_CHECKS and read by nothing, so `checks: [eol]`
+        # validated cleanly and then detected precisely nothing. A check an
+        # operator can name but no code reads is a silently blind scanner.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, sys
+          from fleetdrift.config import ALL_CHECKS
+          src = "\n".join(
+              p.read_text() for p in pathlib.Path("src/fleetdrift").rglob("*.py")
+              if p.name != "config.py"
+          )
+          missing = [c for c in ALL_CHECKS if f'"{c}" in checks' not in src]
+          if missing:
+              sys.exit(f"checks declared but never consumed: {missing}")
+          print("every check in ALL_CHECKS is gated somewhere")
+          PY
+
+      - name: Every catalog pattern survives normalisation
+        # A pattern that normalises to "" can never match, so the rule is dead
+        # code that still reads as coverage on the tin.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from fleetdrift.rules.catalog import BUILTIN_CATALOG
+          from fleetdrift.validation import normalize_software_name
+          dead = [(e.id, p) for e in BUILTIN_CATALOG for p in e.patterns
+                  if not normalize_software_name(p)]
+          if dead:
+              sys.exit(f"unreachable catalog patterns: {dead}")
+          print("all catalog patterns reachable")
+          PY
+
+  smoke:
+    name: end-to-end smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Baseline, then drift
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          rows = [{"name": "Slack.app", "version": "4.0", "signed": "1"}]
+          rec = lambda t, r: json.dumps({
+              "name": "fleetdrift_macos_apps", "hostIdentifier": "h1",
+              "unixTime": t, "snapshot": r,
+              "decorations": {"hostname": "h1.example", "platform": "darwin"}})
+          open("results.log", "w").write(rec(100, rows) + "\n")
+          PY
+          printf 'source:\n  type: resultlog\n  resultlog:\n    path: results.log\nsettings:\n  checks: [catalog, signature]\n' > ci.yml
+
+          fleetdrift scan -c ci.yml -o run1.md
+          grep -q "this run establishes the baseline" run1.md
+
+          python - <<'PY'
+          import json
+          rows = [{"name": "Slack.app", "version": "4.0", "signed": "1"},
+                  {"name": "XMRig", "version": "6.0", "signed": "0"}]
+          rec = json.dumps({"name": "fleetdrift_macos_apps", "hostIdentifier": "h1",
+                            "unixTime": 200, "snapshot": rows,
+                            "decorations": {"hostname": "h1.example", "platform": "darwin"}})
+          open("results.log", "a").write(rec + "\n")
+          PY
+
+          fleetdrift scan -c ci.yml -o run2.md --no-save && rc=0 || rc=$?
+          test "$rc" -eq 1 || { echo "expected exit 1 for findings, got $rc"; exit 1; }
+          grep -q "Changes since last scan" run2.md
+          grep -q "XMRig" run2.md
+          echo "drift detection works end to end"
+
+      - name: Pseudonymisation holds in JSON output
+        run: |
+          set -euo pipefail
+          fleetdrift scan -c ci.yml -f json -o out.json --no-save || true
+          if grep -q "h1.example" out.json; then
+            echo "::error::raw hostname leaked into JSON output"; exit 1
+          fi
+          echo "pseudonymisation holds"
+
+      - name: A broken source exits 2, not 0
+        run: |
+          set -euo pipefail
+          printf 'source:\n  type: resultlog\n  resultlog:\n    path: /nonexistent.log\n' > broken.yml
+          fleetdrift scan -c broken.yml >/dev/null 2>&1 && rc=0 || rc=$?
+          test "$rc" -eq 2 || { echo "expected exit 2, got $rc"; exit 1; }
+          echo "broken source fails loudly"

@@ -1,0 +1,37 @@
+# fleetdrift state — contains a software inventory of every managed endpoint,
+# plus the pseudonymisation salt. Never commit these.
+.fleetdrift/
+*.db
+*.db-wal
+*.db-shm
+salt
+fleet.yml
+report.md
+report.html
+report.json
+*.results.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

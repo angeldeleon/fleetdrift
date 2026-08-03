@@ -1,0 +1,101 @@
+# fleetdrift configuration
+#
+# Copy to fleet.yml and edit. Validate with:
+#     fleetdrift validate -c fleet.yml
+#
+# Unknown keys are a hard error, so a typo fails loudly rather than silently
+# disabling a check.
+
+source:
+  # Where inventory comes from. Both sources are strictly read-only.
+  type: fleet
+
+  fleet:
+    url: https://fleet.example.com
+    # The NAME of an environment variable, never the token itself. A URL or
+    # path here is rejected, so a secret cannot be committed by accident.
+    api_token_env: FLEET_API_TOKEN
+    # A read-only observer token is sufficient. If you find yourself needing
+    # more privilege, something is wrong.
+    #
+    # Set true only for an on-prem Fleet on RFC1918. It does not extend to
+    # anywhere that server redirects to.
+    allow_internal: false
+    # team_id: 3
+    # label_id: 42
+
+  # Alternative source: an osquery results log. Deploy the pack first with
+  #   fleetdrift pack > fleetdrift-pack.json
+  # resultlog:
+  #   path: /var/log/osquery/osqueryd.results.log
+
+privacy:
+  # pseudonymous (default) replaces hostnames with stable labels in every
+  # report, alert and webhook payload. See PRIVACY.md before changing this.
+  mode: pseudonymous
+
+policy:
+  # Software you have approved. Allowlisting the remote-access tool IT actually
+  # deployed is what makes the next unexpected one stand out.
+  allowlist:
+    - Slack
+    - Google Chrome
+    - Microsoft Teams
+    - Zoom
+    # - TeamViewer
+
+  # Explicitly forbidden by policy.
+  denylist:
+    - uTorrent
+
+  # Never reported at all — noise you have already decided about.
+  ignore:
+    - Microsoft Visual C++ Redistributable
+
+  # Flag everything not on the allowlist. Leave false until your allowlist is
+  # curated: on a real estate this produces thousands of findings on day one.
+  enforce_allowlist: false
+
+  # Classifications, including anything `fleetdrift triage` proposed. Commit
+  # this file — its git history is your audit trail.
+  decisions_path: .fleetdrift/decisions.yml
+
+  # Your own catalog entries, merged with the built-in one.
+  # catalog_extra: catalog.yml
+
+settings:
+  checks: [catalog, eol, denylist, allowlist, signature, vulnerabilities]
+  fail_on: high
+  http_timeout: 30
+  max_hosts: 25000
+  state_path: .fleetdrift/fleetdrift.db
+  salt_path: .fleetdrift/salt
+
+notify:
+  # Environment variable NAMES, never the URLs.
+  slack_webhook_url_env: SLACK_WEBHOOK_URL
+  # webhook_url_env: FLEETDRIFT_WEBHOOK_URL
+  min_severity: high
+  max_findings_per_message: 20
+
+  # email:
+  #   smtp_host: smtp.example.com
+  #   smtp_port: 587
+  #   use_starttls: true
+  #   username_env: SMTP_USERNAME
+  #   password_env: SMTP_PASSWORD
+  #   from_address: fleetdrift@example.com
+  #   to_addresses: [security@example.com]
+
+ai:
+  # Off by default. The model cannot change a finding: it writes proposals to
+  # the decision file as `status: pending`, inert until a human approves them.
+  # Enabling this sends software names to a third-party API — never hostnames,
+  # usernames or install paths.
+  enabled: false
+  provider: anthropic
+  model: claude-sonnet-4-5
+  api_key_env: ANTHROPIC_API_KEY
+  summarize: true
+  propose_unknown: true
+  max_items: 40
