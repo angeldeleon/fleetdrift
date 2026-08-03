@@ -99,7 +99,7 @@ jobs:
           set -euo pipefail
           fleetdrift pack --explain > pack.txt
           for forbidden in "FROM file" "FROM users" "shell_history" "process_events" "carve" "SELECT *"; do
-            if grep -qi -- "$forbidden" pack.txt; then
+            if grep -qiF -- "$forbidden" pack.txt; then
               echo "::error::query pack references '$forbidden'"; exit 1
             fi
           done
