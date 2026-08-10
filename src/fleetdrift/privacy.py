@@ -86,9 +86,19 @@ class Pseudonymiser:
         enumerable, and the "tighten permissions" branch would chmod their
         target to 0600 — ``chmod 600 /etc/passwd`` is a working denial of
         service.
+
+        ``O_NONBLOCK`` matters as much as ``O_NOFOLLOW``, and against the same
+        attacker. Opening a FIFO for reading blocks until something opens the
+        write end, and it blocks *inside* ``os.open`` — before the regular-file
+        check below ever runs. A named pipe left in the state directory
+        therefore hung every scheduled run forever, with no timeout and no log
+        line, which for a monitoring tool is the worst shape of failure: the
+        reports simply stop arriving. The flag is cleared once the descriptor is
+        known to be a regular file, where a short read would be a liability
+        rather than a guard.
         """
         try:
-            fd = os.open(self.salt_path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(self.salt_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             return self._create_salt()
         except OSError as exc:
@@ -98,6 +108,7 @@ class Pseudonymiser:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
                 raise ValueError(f"salt path {self.salt_path} is not a regular file")
+            os.set_blocking(fd, True)
             data = os.read(fd, _SALT_BYTES * 4)
             if len(data) < 16:
                 raise ValueError(

@@ -263,7 +263,8 @@ class TestAnalysis:
         path = tmp_path / "decisions.yml"
         path.write_text(
             "version: 1\ndecisions:\n  - name: anydesk\n    status: approved\n"
-            "    verdict: allow\n    category: remote_access\n    severity: high\n",
+            "    verdict: allow\n    category: remote_access\n    severity: high\n"
+            "    reviewed_by: angel\n",
             encoding="utf-8",
         )
         inventory = Inventory(collected_at="t", source="test")

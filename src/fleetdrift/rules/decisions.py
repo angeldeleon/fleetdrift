@@ -124,6 +124,19 @@ def _decision_from_mapping(raw: Any, index: int) -> Decision:
     except ValueError as exc:
         raise ValidationError(f"decision {index} has an unknown category") from exc
 
+    reviewed_by = safe_text(raw.get("reviewed_by") or "", limit=128)
+    if status == STATUS_APPROVED and not reviewed_by:
+        # An approved entry is the only kind that changes a finding, so it is
+        # the only kind whose provenance matters. Accepting one with no reviewer
+        # meant a proposal could be promoted by a one-word edit with nobody's
+        # name against it -- which is the "the model decided" answer this whole
+        # design exists to avoid having to give an auditor. A hard error rather
+        # than a warning: this runs from cron, and nobody reads the warnings.
+        raise ValidationError(
+            f"decision {index} ({name!r}) has status 'approved' but an empty 'reviewed_by'; "
+            "an approved decision must name whoever approved it"
+        )
+
     return Decision(
         name=name,
         status=status,
@@ -132,7 +145,7 @@ def _decision_from_mapping(raw: Any, index: int) -> Decision:
         severity=Severity.parse(str(raw.get("severity", "medium"))),
         note=safe_text(raw.get("note") or "", limit=500),
         proposed_by=safe_text(raw.get("proposed_by") or "human", limit=64),
-        reviewed_by=safe_text(raw.get("reviewed_by") or "", limit=128),
+        reviewed_by=reviewed_by,
         updated_at=safe_text(raw.get("updated_at") or "", limit=64),
     )
 
@@ -266,7 +279,8 @@ _FILE_HEADER = """\
 # Entries with `status: pending` have NO effect. They are drafts — usually
 # proposed by the optional AI triage layer — waiting for a human.
 #
-# To act on one, set `status: approved` and fill in `reviewed_by`:
+# To act on one, set `status: approved` and fill in `reviewed_by`, which is
+# required for an approved entry and is refused without it:
 #   verdict: allow  -> stop reporting this software
 #   verdict: flag   -> report it, using the category and severity below
 #

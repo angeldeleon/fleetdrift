@@ -108,6 +108,13 @@ def normalize_software_name(value: object) -> str:
       unclassified, and produced no drift finding. A one-character rename bought
       total invisibility, which for a tool whose input is chosen by malware is
       the worst possible failure mode.
+    * **Never empty for a name that has any content.** The separator strip is
+      the right rule for letters and digits and the wrong one for a name made
+      only of punctuation, symbols or emoji: ``+++`` and ``🔒`` reduced to ``""``
+      and hit the same "skip empty names" branch, which bought the same total
+      invisibility by a different spelling. Falling back to the sanitised text
+      keeps such an item visible to every check and to drift; it is still
+      case- and width-folded, so it is still a stable key.
     """
     text = unicodedata.normalize("NFKC", safe_text(value)).casefold()
     text = re.sub(r"\.(app|exe|msi|pkg|dmg)$", "", text)
@@ -117,7 +124,11 @@ def normalize_software_name(value: object) -> str:
     text = re.sub(r"[\s\-_]+v?\d+(?:\.\d+)*\s*$", "", text)
     # \w is Unicode-aware, so this keeps letters and digits in every script and
     # drops punctuation. Underscore is a \w character but reads as a separator.
-    text = re.sub(r"[\W_]+", " ", text)
+    stripped = " ".join(re.sub(r"[\W_]+", " ", text).split())
+    if stripped:
+        return stripped
+    # Nothing but separators survived. The version and decoration strips above
+    # have already run, so "+++ 1.0" and "+++ 2.0" still collapse to one key.
     return " ".join(text.split())
 
 

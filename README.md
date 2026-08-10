@@ -157,7 +157,7 @@ Off by default. Two capabilities, neither able to change a finding.
 
 **Summarise** — a paragraph at the top of the report. Cosmetic.
 
-**Triage** — `fleetdrift triage` proposes classifications for software no rule matched. Proposals land in `decisions.yml` as `status: pending` and **have no effect until a human sets `status: approved`**.
+**Triage** — `fleetdrift triage` proposes classifications for software no rule matched. Proposals land in `decisions.yml` as `status: pending` and **have no effect until a human sets `status: approved`** and names themselves in `reviewed_by`. That field is required on an approved entry: without it the file is rejected, because an approval nobody signed is not an audit trail.
 
 That's what makes this learning rather than guessing: knowledge accumulates in a reviewed, version-controlled file, every classification carries a named reviewer, and `git log` on that file answers an auditor's question in a way "the model decided" never will.
 

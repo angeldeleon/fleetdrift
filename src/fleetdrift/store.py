@@ -149,12 +149,19 @@ class SnapshotStore:
         Checked through a descriptor rather than by path: ``os.path.islink``
         followed by ``sqlite3.connect`` is two lookups of the same name and the
         attacker owns what happens in between.
+
+        ``O_NONBLOCK`` is here for the same reason as ``O_NOFOLLOW``. Opening a
+        FIFO for reading blocks inside ``os.open`` until a writer appears, so
+        the regular-file check below never got the chance to reject one: a named
+        pipe left at the state path hung every run indefinitely rather than
+        failing. Cleared once the descriptor is known to be a regular file.
         """
-        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)  # raises ELOOP on a link
+        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # ELOOP on a link
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
                 raise StateError(f"state database {self.path} is not a regular file; refusing to open it")
+            os.set_blocking(fd, True)
             if info.st_mode & 0o077:
                 # Repair through the descriptor, not the path.
                 os.fchmod(fd, 0o600)

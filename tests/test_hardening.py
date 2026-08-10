@@ -18,7 +18,13 @@ import pytest
 
 from fleetdrift import ai, notify
 from fleetdrift.analyze import Analyzer
-from fleetdrift.config import AIConfig, FleetSourceConfig, ResultLogSourceConfig, parse_config
+from fleetdrift.config import (
+    AIConfig,
+    FleetSourceConfig,
+    NotifyConfig,
+    ResultLogSourceConfig,
+    parse_config,
+)
 from fleetdrift.drift import diff_inventories
 from fleetdrift.httpclient import _origin
 from fleetdrift.models import (
@@ -43,7 +49,7 @@ from fleetdrift.sources.base import SourceError
 from fleetdrift.sources.fleet import FleetSource
 from fleetdrift.sources.resultlog import ResultLogSource
 from fleetdrift.store import SnapshotStore, StateError
-from fleetdrift.validation import normalize_software_name, safe_text
+from fleetdrift.validation import ValidationError, normalize_software_name, safe_text
 
 
 def _host(host_id: str = "h1") -> Host:
@@ -128,6 +134,30 @@ class TestMarkdownInjection:
     def test_slack_code_span_is_closed_against_backticks(self) -> None:
         assert "`" not in _escape_code("Zoom` *owned*")
         assert "&lt;" in _escape_code("<https://evil.example|Fix>")
+
+    def test_a_bare_url_cannot_autolink_in_prose(self) -> None:
+        """Regression: the escape set covers link *syntax*, and a bare URL uses
+        none of it. GitHub-flavoured Markdown, and most of the ticket systems a
+        report is pasted into, autolink `https://…` on sight -- so a package
+        named "Update Required https://evil.example/patch" put a live phishing
+        link in the finding line an analyst reads, which is what the escaping
+        exists to prevent. Quarantined in a code span, where no CommonMark
+        implementation autolinks."""
+        assert _md("Update Required https://evil.example/patch") == (
+            "Update Required `https://evil.example/patch`"
+        )
+        assert _md("see www.evil.example now") == "see `www.evil.example` now"
+        assert _md("mail mailto:ops@evil.example") == "mail `mailto:ops@evil.example`"
+
+    def test_a_bare_url_in_a_title_is_quarantined_end_to_end(self) -> None:
+        title = "AnyDesk https://evil.example/patch is not code-signed"
+        rendered = "\n".join(_render_findings([_finding(software="AnyDesk", title=title)]))
+        assert "`https://evil.example/patch`" in rendered
+        assert " https://evil.example" not in rendered, "an autolinkable URL survived"
+
+    def test_ordinary_names_are_not_dragged_into_a_code_span(self) -> None:
+        assert _md("Microsoft Visual C++ Redistributable") == "Microsoft Visual C++ Redistributable"
+        assert _md("1.2 -> 1.3") == "1.2 -> 1.3"
 
     def test_reference_urls_must_be_plain_links(self) -> None:
         assert _md_url("https://osv.dev/vulnerability/CVE-2024-1") != ""
@@ -332,6 +362,19 @@ class TestSaltHandling:
 
         assert stat.S_IMODE(os.stat(victim).st_mode) == 0o644, "victim was chmod'd through the link"
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs only")
+    def test_a_fifo_salt_path_fails_instead_of_hanging(self, tmp_path) -> None:
+        """Regression: opening a FIFO for reading blocks until a writer appears,
+        and it blocks inside os.open -- before the regular-file check below can
+        reject it. A named pipe in the state directory therefore hung every
+        scheduled run forever, with no timeout and no log line, so the reports
+        just stopped arriving. Same attacker as the symlink case above.
+        """
+        path = tmp_path / "salt"
+        os.mkfifo(path)
+        with pytest.raises(ValueError, match="not a regular file"):
+            Pseudonymiser(path).host_label("h1", "host")
+
     def test_normal_creation_still_works(self, tmp_path) -> None:
         salt = tmp_path / "salt"
         label = Pseudonymiser(salt).host_label("h1", "host")
@@ -352,6 +395,60 @@ class TestOutputBounds:
         payload = report.to_dict()
         assert len(payload["unknown_software"]) == 200
         assert payload["unknown_software_total"] == 5000
+
+    def _webhook_payload(self, config: NotifyConfig, findings: list) -> dict:
+        captured: dict = {}
+
+        def fake(method, url, **kwargs):
+            captured.update(kwargs.get("json_body") or {})
+
+            class _R:
+                status_code = 200
+
+            return _R()
+
+        report = ScanReport(
+            started_at="t",
+            finished_at="t",
+            tool_version="0.1.0",
+            source="test",
+            hosts_scanned=1,
+            findings=findings,
+        )
+        with mock.patch.object(notify, "safe_request", fake):
+            assert notify.notify(report, config) == []
+        return captured
+
+    def test_the_webhook_honours_the_finding_cap(self, monkeypatch) -> None:
+        """Regression: Slack and email honoured notify.max_findings_per_message
+        and the webhook did not, so it serialised every finding at or above the
+        threshold. On a large estate with enforce_allowlist on that is tens of
+        megabytes in one POST, and the scan that found the most became the one
+        whose alert the receiver dropped."""
+        monkeypatch.setenv("FLEETDRIFT_TEST_WEBHOOK", "https://hooks.example/x")
+        config = NotifyConfig(
+            webhook_url_env="FLEETDRIFT_TEST_WEBHOOK",
+            min_severity=Severity.INFO,
+            max_findings_per_message=5,
+        )
+        payload = self._webhook_payload(config, [_finding(software=f"s{i}") for i in range(200)])
+
+        assert len(payload["findings"]) == 5
+        # Whole, so a receiver can tell it is looking at a subset.
+        assert payload["findings_total"] == 200
+        assert payload["findings_truncated"] is True
+        assert payload["counts_by_severity"]["high"] == 200
+
+    def test_a_short_finding_list_is_not_marked_truncated(self, monkeypatch) -> None:
+        monkeypatch.setenv("FLEETDRIFT_TEST_WEBHOOK", "https://hooks.example/x")
+        config = NotifyConfig(
+            webhook_url_env="FLEETDRIFT_TEST_WEBHOOK",
+            min_severity=Severity.INFO,
+            max_findings_per_message=20,
+        )
+        payload = self._webhook_payload(config, [_finding(software="s0")])
+        assert payload["findings_total"] == 1
+        assert payload["findings_truncated"] is False
 
 
 class TestDatabasePermissions:
@@ -434,6 +531,59 @@ class TestNameNormalisation:
         for variant in ("AnyDesk.app", "AnyDesk (64-bit)", "AnyDesk 8.0.8", "anydesk"):
             assert normalize_software_name(variant) == "anydesk"
 
+    def test_symbol_only_names_are_not_erased(self) -> None:
+        """The same total invisibility as above, reached by a different spelling.
+
+        The separator strip is right for letters and digits and wrong for a name
+        made only of punctuation, symbols or emoji: `+++` and a single emoji
+        reduced to "" and hit the same "skip empty names" branch in every
+        caller. The attacker picks the name, so this is a rename away.
+        """
+        for name in ("+++", "🔒", "...", "· ·"):
+            assert normalize_software_name(name), f"{name!r} normalises to ''"
+
+    def test_a_symbol_only_name_is_still_a_stable_key(self) -> None:
+        """Drift needs the same package to produce the same key across runs."""
+        assert normalize_software_name("+++ 1.0") == normalize_software_name("+++ 2.0")
+        assert normalize_software_name("🔒") == normalize_software_name("🔒 3.4.5")
+
+
+class TestSymbolOnlyNames:
+    """What the empty normalisation cost, checked where an operator would feel it."""
+
+    def _analyze(self, item):
+        config = parse_config(
+            {
+                "source": {"type": "resultlog", "resultlog": {"path": "/nonexistent/a.log"}},
+                "settings": {"checks": ["catalog", "signature"]},
+            }
+        )
+        inventory = Inventory(collected_at="t", source="test")
+        inventory.hosts.append(HostSnapshot(host=_host(), software=[item]))
+        analyzer = Analyzer(
+            config,
+            catalog=CatalogMatcher(),
+            decisions=DecisionStore("/nonexistent/decisions.yml"),
+            host_label=lambda h: h.display,
+        )
+        return analyzer.analyze(inventory), analyzer
+
+    def test_an_unsigned_symbol_only_name_still_reaches_the_report(self) -> None:
+        """The signature check does not look at the name at all, and was skipped
+        anyway: the empty-name guard sits above every check in the loop, so an
+        unsigned binary called `+++` produced nothing whatsoever."""
+        findings, analyzer = self._analyze(dataclasses.replace(_sw("+++"), signed=False))
+        assert [f for f in findings if f.category is RiskCategory.UNSIGNED]
+        assert analyzer.unknown_software, "an unclassifiable name must still be triageable"
+
+    def test_a_symbol_only_name_still_produces_a_drift_finding(self) -> None:
+        """Drift is what covers the software no rule has a name for, which is
+        exactly the software this bug made invisible."""
+        previous = {"h1": HostSnapshot(host=_host(), software=[_sw("Slack")])}
+        current = Inventory(collected_at="t", source="test")
+        current.hosts.append(HostSnapshot(host=_host(), software=[_sw("Slack"), _sw("🔒")]))
+        assert [f for f in _diff(previous, current) if f.kind is FindingKind.DRIFT]
+
 
 class TestHostileUnicode:
     def test_lone_surrogates_cannot_deny_the_whole_scan(self) -> None:
@@ -504,6 +654,26 @@ class TestSummaryBlockInjection:
         for line in rendered.split("\n"):
             assert not line.startswith(("_", "*", "|", "-", "#", ">", "+", "=")), line
 
+    def test_a_tilde_fence_cannot_swallow_the_findings_below_it(self) -> None:
+        """`~~~` is the tilde spelling of a fenced code block. The backtick
+        spelling was already escaped, this one was not, and a fence that is
+        never closed runs to the end of the document -- so every finding under
+        the Summary heading rendered as preformatted text instead."""
+        rendered = _md_block("The fleet looks fine.\n~~~\nnothing to see")
+        assert "\n\\~~~\n" in rendered
+
+    def test_a_leading_number_is_suppressed_without_a_stray_backslash(self) -> None:
+        """Over-escaping. CommonMark honours a backslash only before ASCII
+        punctuation, so escaping the digit suppressed the ordered list and
+        showed the reader "\\3 machines gained AnyDesk". Escape the marker."""
+        assert _md_block("3 machines gained AnyDesk overnight.") == "3 machines gained AnyDesk overnight."
+        assert _md_block("3. AnyDesk") == "3\\. AnyDesk"
+
+    def test_a_bare_url_in_the_summary_cannot_autolink(self) -> None:
+        assert _md_block("Check https://evil.example/patch today.") == (
+            "Check `https://evil.example/patch` today."
+        )
+
     def test_ordinary_prose_is_untouched(self) -> None:
         assert _md_block("Three hosts gained remote-access tools.\n\nReview them.") == (
             "Three hosts gained remote-access tools.\n\nReview them."
@@ -535,6 +705,15 @@ class TestStateFileSymlink:
         link.symlink_to(tmp_path / "absent.db")
         with pytest.raises(StateError):
             SnapshotStore(link, scope="p").save(Inventory(collected_at="t", source="x"))
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs only")
+    def test_a_fifo_state_path_fails_instead_of_hanging(self, tmp_path) -> None:
+        """The same blocking open as the salt file, and the same consequence:
+        the run never returns rather than refusing the path."""
+        path = tmp_path / "state.db"
+        os.mkfifo(path)
+        with pytest.raises(StateError, match="not a regular file"):
+            SnapshotStore(path, scope="p").save(Inventory(collected_at="t", source="x"))
 
     def test_loose_permissions_are_repaired(self, tmp_path) -> None:
         path = tmp_path / "state.db"
@@ -690,6 +869,40 @@ class TestAiPrivacy:
         body = json.dumps(captured)
         assert "alice-macbook" not in body
         assert "machine-1" in body
+
+
+class TestDecisionReview:
+    """An approved decision is the only kind that changes a finding."""
+
+    def _store(self, tmp_path, body: str) -> DecisionStore:
+        path = tmp_path / "decisions.yml"
+        path.write_text(f"version: 1\ndecisions:\n{body}", encoding="utf-8")
+        return DecisionStore(path)
+
+    def test_an_approved_decision_needs_a_named_reviewer(self, tmp_path) -> None:
+        """The file is described as an audit trail in which every classification
+        carries a named reviewer, and nothing enforced it: a proposal could be
+        promoted to "approved" -- taking full effect on category and severity --
+        with nobody's name against it, which is the answer this design exists so
+        that an auditor never has to accept."""
+        store = self._store(tmp_path, "  - name: acme agent\n    status: approved\n    verdict: flag\n")
+        with pytest.raises(ValidationError, match="reviewed_by"):
+            store.load()
+
+    def test_a_named_reviewer_makes_it_active(self, tmp_path) -> None:
+        store = self._store(
+            tmp_path,
+            "  - name: acme agent\n    status: approved\n    verdict: flag\n    reviewed_by: angel\n",
+        )
+        decision = store.active_for("acme agent")
+        assert decision is not None
+        assert decision.reviewed_by == "angel"
+
+    def test_a_pending_proposal_needs_no_reviewer(self, tmp_path) -> None:
+        """A proposal is unreviewed by definition; only approval needs a name."""
+        store = self._store(tmp_path, "  - name: acme agent\n    status: pending\n")
+        assert store.active_for("acme agent") is None
+        assert "acme agent" in store.known_names()
 
 
 class TestFleetPaginationCap:

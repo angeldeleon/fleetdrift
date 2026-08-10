@@ -44,6 +44,38 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 # report an analyst opens in a ticket.
 _MD_ESCAPE_RE = re.compile(r"([`\[\]()!])")
 
+# A bare URL needs none of the metacharacters above. GitHub-flavoured Markdown,
+# and most of the ticket systems a report gets pasted into, autolink
+# ``https://…`` and ``www.…`` on sight — so a package named
+# ``Update Required https://evil.example/patch`` still put a live phishing link
+# in the finding line an analyst reads, which is the outcome the escaping above
+# exists to prevent, reached without a single escapable character. Escaping
+# cannot fix it: the autolinker matches the shape of the text, not a
+# metacharacter. Autolinking never happens inside a code span, in any
+# CommonMark implementation, so a URL-shaped run is moved into one instead. The
+# run stops at whitespace and at a backtick, so the span it opens always closes.
+_BARE_URL_RE = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]*:/{2}|www\.|mailto:|xmpp:)[^\s`]*")
+
+
+def _md_escape(text: str) -> str:
+    """Escape the Markdown metacharacters in a run of ordinary text."""
+    return _MD_ESCAPE_RE.sub(r"\\\1", text).replace("<", "&lt;")
+
+
+def _md_inline(collapsed: str) -> str:
+    """Escape one already-collapsed line, quarantining any URL-shaped run."""
+    out: list[str] = []
+    position = 0
+    for match in _BARE_URL_RE.finditer(collapsed):
+        out.append(_md_escape(collapsed[position : match.start()]))
+        # Entity-escaped inside the span for the reason :func:`_code` gives: a
+        # renderer that mishandles code spans should not be the only thing
+        # standing between endpoint-chosen text and an ``<img>`` tag.
+        out.append("`" + match.group().replace("<", "&lt;").replace(">", "&gt;") + "`")
+        position = match.end()
+    out.append(_md_escape(collapsed[position:]))
+    return "".join(out)
+
 
 def _md(text: object) -> str:
     """Neutralise endpoint-supplied text for Markdown.
@@ -53,7 +85,7 @@ def _md(text: object) -> str:
     everywhere would render every "1.2 -> 1.3" as "-&gt;".
     """
     collapsed = " ".join(_CONTROL_CHARS_RE.sub(" ", str(text)).split())
-    escaped = _MD_ESCAPE_RE.sub(r"\\\1", collapsed).replace("<", "&lt;")
+    escaped = _md_inline(collapsed)
     if escaped.startswith(">"):
         escaped = "&gt;" + escaped[1:]
     return escaped
@@ -104,18 +136,29 @@ def _md_block(text: object) -> str:
     for line in lines:
         if line:
             blanks = 0
-            escaped = _MD_ESCAPE_RE.sub(r"\\\1", line).replace("<", "&lt;")
-            # A line beginning with >, #, -, *, _, |, + or = creates a
-            # blockquote, heading, list, rule or table. This text is model
-            # output, and the model's input includes attacker-chosen software
-            # names, so it must not be able to restructure the report it lands
-            # in. `*` and `_` open bullets and thematic breaks (`___`); `|`
+            escaped = _md_inline(line)
+            # A line beginning with >, #, -, *, _, |, +, = or ~ creates a
+            # blockquote, heading, list, rule, table or code fence. This text is
+            # model output, and the model's input includes attacker-chosen
+            # software names, so it must not be able to restructure the report it
+            # lands in. `*` and `_` open bullets and thematic breaks (`___`); `|`
             # opens a table row, and a table's `| --- |` separator was not
             # covered by the leading-`-` case because the `|` comes first --
             # which was enough to render a forged "all clear" table inside the
-            # Summary section of a report an analyst reads.
-            if escaped[:1] in (">", "#", "-", "+", "=", "*", "_", "|") or escaped[:1].isdigit():
+            # Summary section of a report an analyst reads. `~~~` is the tilde
+            # spelling of a fenced code block; its backtick twin was already
+            # covered by the escape above, and a fence that is never closed runs
+            # to the end of the document, swallowing every finding below it.
+            if escaped[:1] in (">", "#", "-", "+", "=", "*", "_", "|", "~"):
                 escaped = "\\" + escaped
+            else:
+                # An ordered list needs digits followed by `.` or `)`. Escaping
+                # the digit did suppress the list, but showed the reader a stray
+                # backslash: CommonMark honours a backslash only before ASCII
+                # punctuation, so "3 machines gained AnyDesk" rendered as
+                # "\3 machines gained AnyDesk". Escape the marker instead --
+                # `)` is already covered by _MD_ESCAPE_RE, so only `.` is left.
+                escaped = re.sub(r"^(\d{1,9})\.", r"\1\\.", escaped)
             out.append(escaped)
         else:
             blanks += 1

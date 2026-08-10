@@ -62,7 +62,13 @@ def notify(report: ScanReport, config: NotifyConfig, *, user_agent: str = "fleet
 
     if config.webhook_url():
         try:
-            _post_generic(config.webhook_url() or "", report, relevant, user_agent=user_agent)
+            _post_generic(
+                config.webhook_url() or "",
+                report,
+                relevant,
+                limit=config.max_findings_per_message,
+                user_agent=user_agent,
+            )
         except (HTTPError, ValidationError) as exc:
             errors.append(f"webhook delivery failed: {exc}")
             log.error("webhook delivery failed: %s", exc)
@@ -93,7 +99,15 @@ def notify(report: ScanReport, config: NotifyConfig, *, user_agent: str = "fleet
 # --------------------------------------------------------------------------
 
 
-def _post_generic(url: str, report: ScanReport, findings: list, *, user_agent: str) -> None:
+def _post_generic(url: str, report: ScanReport, findings: list, *, limit: int, user_agent: str) -> None:
+    # Capped like every other destination. Slack and email have honoured
+    # notify.max_findings_per_message from the start; this one serialised every
+    # finding at or above the threshold, so a large estate with
+    # enforce_allowlist on POSTed tens of megabytes in one request -- and the
+    # scan that found the most became the one whose alert the receiver dropped.
+    # The severity counts and the total stay whole, so a receiver can always
+    # tell it is looking at a subset and go to the report for the rest.
+    shown = findings[:limit]
     payload = {
         "tool": "fleetdrift",
         "tool_version": report.tool_version,
@@ -101,7 +115,9 @@ def _post_generic(url: str, report: ScanReport, findings: list, *, user_agent: s
         "hosts_scanned": report.hosts_scanned,
         "affected_hosts": report.affected_hosts(),
         "counts_by_severity": report.counts_by_severity(),
-        "findings": [f.to_dict() for f in findings],
+        "findings": [f.to_dict() for f in shown],
+        "findings_total": len(findings),
+        "findings_truncated": len(findings) > len(shown),
     }
     response = safe_request("POST", url, json_body=payload, user_agent=user_agent)
     if response.status_code >= 400:
