@@ -34,12 +34,13 @@ from typing import Any
 import yaml
 
 from ..models import RiskCategory, Severity
-from ..validation import ValidationError, normalize_software_name, safe_text
+from ..validation import ValidationError, normalize_software_name, read_text_file, safe_text
 
 log = logging.getLogger(__name__)
 
 FILE_VERSION = 1
 _MAX_DECISIONS = 20000
+_MAX_DECISION_BYTES = 10 * 1024 * 1024
 
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
@@ -163,14 +164,20 @@ class DecisionStore:
             return self._decisions
         self._loaded = True
 
-        if not self.path.exists():
-            return self._decisions
-
-        if self.path.stat().st_size > 10 * 1024 * 1024:
-            raise ValidationError(f"decision file is too large: {self.path}")
+        # Read through a descriptor. This file is committed alongside the
+        # config, so on CI it lives in the checked-out repository -- and it is
+        # the file that decides which software stops being reported, which makes
+        # where it is read from a security decision. See
+        # :func:`fleetdrift.validation.read_text_file`.
+        try:
+            text = read_text_file(self.path, max_bytes=_MAX_DECISION_BYTES, what="decision file")
+        except ValidationError as exc:
+            if "not found" in str(exc):
+                return self._decisions
+            raise
 
         try:
-            raw = yaml.safe_load(self.path.read_text(encoding="utf-8"))
+            raw = yaml.safe_load(text)
         except yaml.YAMLError as exc:
             raise ValidationError(f"decision file is not valid YAML: {exc}") from exc
 
@@ -259,12 +266,15 @@ class DecisionStore:
             prefix=".fleetdrift-decisions-", suffix=".tmp", dir=str(self.path.parent)
         )
         try:
+            # Through the descriptor, before anything is written to it. chmod by
+            # path names the file a second time, and between mkstemp and that
+            # second lookup the name can be something else.
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(_FILE_HEADER)
                 handle.write(serialized)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(tmp_name, 0o600)
             os.replace(tmp_name, self.path)
         finally:
             # On success os.replace already consumed the temp file; this only

@@ -27,9 +27,11 @@ from typing import Any
 import yaml
 
 from ..models import RiskCategory, Severity
-from ..validation import ValidationError, normalize_software_name, safe_text
+from ..validation import ValidationError, normalize_software_name, read_text_file, safe_text
 
 log = logging.getLogger(__name__)
+
+_MAX_CATALOG_BYTES = 5 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,13 +423,14 @@ def load_catalog(extra_path: str | Path | None = None) -> tuple[CatalogEntry, ..
         return tuple(entries)
 
     path = Path(extra_path).expanduser()
-    if not path.is_file():
-        raise ValidationError(f"catalog file not found: {path}")
-    if path.stat().st_size > 5 * 1024 * 1024:
-        raise ValidationError(f"catalog file is too large: {path}")
+    # Read through a descriptor: the path comes from the config and usually
+    # points inside the repository the scan runs from, so is_file() followed by
+    # read_text() checked one name and read another. See
+    # :func:`fleetdrift.validation.read_text_file`.
+    text = read_text_file(path, max_bytes=_MAX_CATALOG_BYTES, what="catalog file")
 
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ValidationError(f"catalog file is not valid YAML: {exc}") from exc
 

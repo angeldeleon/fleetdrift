@@ -136,6 +136,89 @@ jobs:
           print("every check in ALL_CHECKS is gated somewhere")
           PY
 
+      - name: Every file the tool opens refuses a symlink and a FIFO
+        # The state database, the report, the results log, the catalog and the
+        # decision file are all written or read where CI can also write. Every
+        # os.open in the tree carries O_NOFOLLOW, and every read carries
+        # O_NONBLOCK as well, so a planted link cannot redirect them and a
+        # planted pipe cannot hang the run before the regular-file check.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          for path in pathlib.Path("src/fleetdrift").rglob("*.py"):
+              text = path.read_text()
+              for match in re.finditer(r"os\.open\((.*?)\)\n", text, re.S):
+                  call = match.group(1)
+                  if "O_NOFOLLOW" not in call:
+                      bad.append(f"{path}: os.open without O_NOFOLLOW")
+                  if "O_RDONLY" in call and "O_NONBLOCK" not in call:
+                      bad.append(f"{path}: read without O_NONBLOCK")
+          for forbidden in ("path.read_text(", "path.write_text(", ".open(\"r\""):
+              for path in pathlib.Path("src/fleetdrift").rglob("*.py"):
+                  if path.name == "config.py":
+                      continue  # the config file is the one input read before anything is trusted
+                  if forbidden in path.read_text():
+                      bad.append(f"{path}: {forbidden} bypasses the guarded reader")
+          if bad:
+              sys.exit("\n".join(bad))
+          print("every open is guarded")
+          PY
+
+      - name: A host that reported nothing is not an uninstall
+        # "Could not determine" and "absent" are different facts, and reporting
+        # the first as the second announces remediation that did not happen.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from fleetdrift.drift import diff_inventories
+          from fleetdrift.models import Host, HostSnapshot, Inventory, Platform, SoftwareItem
+          from fleetdrift.rules.catalog import BUILTIN_CATALOG, CatalogMatcher
+          from fleetdrift.rules.decisions import DecisionStore
+          host = Host(host_id="h1", display="h1.corp", platform=Platform.MACOS)
+          previous = {"h1": HostSnapshot(host=host, software=[
+              SoftwareItem(host_id="h1", name="AnyDesk", version="1.0", source="apps")])}
+          current = Inventory(collected_at="t", source="test")
+          current.hosts.append(HostSnapshot(host=host, software=[]))
+          findings = diff_inventories(
+              previous, current, catalog=CatalogMatcher(entries=BUILTIN_CATALOG),
+              decisions=DecisionStore("/nonexistent/decisions.yml"), ignore=set(),
+              allowlist=set(), host_label=lambda h: h.display,
+          )
+          if findings:
+              sys.exit(f"an empty collection produced {len(findings)} change finding(s)")
+          print("an empty collection is not a set of uninstalls")
+          PY
+
+      - name: Nothing credential-shaped survives into a report
+        # Evidence carries osquery row fields and an operator's own catalog
+        # entries, and it is rendered four ways.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from fleetdrift.models import (
+              Finding, FindingKind, RiskCategory, ScanReport, Severity,
+          )
+          from fleetdrift.report import render
+          finding = Finding(
+              host_display="h1", host_id="h1", software="Thing", version="1.0",
+              kind=FindingKind.POSTURE, severity=Severity.HIGH,
+              category=RiskCategory.UNKNOWN, title="t", detail="d",
+              evidence={"license_key": "ABCD-1234-EFGH", "api_key": "AKIAIOSFODNN7EXAMPLE"},
+          )
+          report = ScanReport(started_at="t", finished_at="t", tool_version="0",
+                              source="test", findings=[finding])
+          for fmt in ("markdown", "json", "html"):
+              rendered = render(report, fmt)
+              for secret in ("ABCD-1234-EFGH", "AKIAIOSFODNN7EXAMPLE"):
+                  if secret in rendered:
+                      sys.exit(f"{secret} reached the {fmt} report")
+          print("no credential shape reached any report format")
+          PY
+
       - name: Every catalog pattern survives normalisation
         # A pattern that normalises to "" can never match, so the rule is dead
         # code that still reads as coverage on the tin.

@@ -98,6 +98,16 @@ def diff_inventories(
             # reports the whole machine as newly installed, and a new laptop is
             # not 200 incidents.
             continue
+        if not snapshot.software:
+            # The mirror image, and the one that was missing: a host that
+            # reported nothing *this* run. "It reported nothing" and "everything
+            # was uninstalled" are different facts, and treating the first as
+            # the second reports remediation that did not happen — a security
+            # report saying the cryptominer is gone is worse than one that says
+            # nothing at all. Both collectors already drop a host with an empty
+            # inventory before it reaches here; this does not depend on them
+            # continuing to, because the cost of being wrong is a false all-clear.
+            continue
 
         before = {item.key: item for item in baseline.software}
         after = {item.key: item for item in snapshot.software}

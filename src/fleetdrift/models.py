@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from .validation import scrub_evidence
+
 
 class Severity(str, Enum):
     """Finding severity, ordered.
@@ -213,6 +215,10 @@ class Finding:
         out["severity"] = self.severity.value
         out["category"] = self.category.value
         out["references"] = list(self.references)
+        # Scrubbed here, at the one place every sink goes through, rather than
+        # in each renderer. Evidence carries osquery row fields and an
+        # operator's own catalog entries, both of which can name anything.
+        out["evidence"] = scrub_evidence(self.evidence)
         out["fingerprint"] = self.fingerprint
         return out
 
@@ -248,6 +254,12 @@ class Inventory:
     @property
     def software_count(self) -> int:
         return sum(len(h.software) for h in self.hosts)
+
+
+# Serialisation caps. Both sit far above any healthy run and well below the
+# point where a JSON report stops being a file anybody can open.
+MAX_SERIALISED_FINDINGS = 2000
+MAX_SERIALISED_ERRORS = 200
 
 
 @dataclass(slots=True)
@@ -304,13 +316,20 @@ class ScanReport:
             "baseline_available": self.baseline_available,
             "scan_degraded": self.scan_degraded,
             "counts_by_severity": self.counts_by_severity(),
-            "collection_errors": self.collection_errors,
+            "collection_errors": self.collection_errors[:MAX_SERIALISED_ERRORS],
             # Capped: the Markdown renderer already truncates, and an estate
             # with thousands of unclassified packages would otherwise ship the
             # whole list to a webhook.
             "unknown_software": self.unknown_software[:200],
             "unknown_software_total": len(self.unknown_software),
-            "findings": [f.to_dict() for f in self.findings],
+            # Capped for the same reason unknown_software is: an estate with a
+            # bad week can produce more findings than any report reader or
+            # webhook receiver will accept, and the run that found the most must
+            # not be the one whose output nobody can open. The total stays whole
+            # above the cap so a consumer can tell it is reading a subset.
+            "findings": [f.to_dict() for f in self.findings[:MAX_SERIALISED_FINDINGS]],
+            "findings_total": len(self.findings),
+            "findings_truncated": len(self.findings) > MAX_SERIALISED_FINDINGS,
             "ai_summary": self.ai_summary,
         }
 

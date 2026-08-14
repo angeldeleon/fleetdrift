@@ -922,3 +922,227 @@ class TestFleetPaginationCap:
         hosts = source._list_hosts(inventory)
         assert len(hosts) == 10
         assert any("max_hosts" in e for e in inventory.errors), inventory.errors
+
+
+class TestEmptyCurrentSnapshotIsNotAnUninstall:
+    """The mirror of the empty-baseline guard, and the one that was missing.
+
+    "The host reported nothing this run" and "everything was uninstalled" are
+    different facts. Reporting the first as the second announces remediation
+    that did not happen, which is worse than saying nothing.
+    """
+
+    def test_a_host_that_reported_nothing_produces_no_removals(self) -> None:
+        previous = {"h1": HostSnapshot(host=_host(), software=[_sw("AnyDesk")])}
+        current = Inventory(collected_at="t", source="test")
+        current.hosts.append(HostSnapshot(host=_host(), software=[]))
+        assert _diff(previous, current) == []
+
+    def test_a_real_uninstall_is_still_reported(self) -> None:
+        previous = {"h1": HostSnapshot(host=_host(), software=[_sw("AnyDesk"), _sw("Slack")])}
+        current = Inventory(collected_at="t", source="test")
+        current.hosts.append(HostSnapshot(host=_host(), software=[_sw("Slack")]))
+        assert any("removed" in f.title for f in _diff(previous, current))
+
+
+class TestResultLogIsOpenedThroughADescriptor:
+    """A results log lives in a drop directory shared with whatever ships it."""
+
+    def _source(self, path) -> ResultLogSource:
+        return ResultLogSource(ResultLogSourceConfig(path=str(path)))
+
+    def test_a_symlinked_results_log_is_refused(self, tmp_path) -> None:
+        target = tmp_path / "secrets.log"
+        target.write_text("{}\n", encoding="utf-8")
+        link = tmp_path / "results.log"
+        link.symlink_to(target)
+
+        with pytest.raises(SourceError, match="cannot open results log"):
+            self._source(link).collect()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs only")
+    def test_a_fifo_results_log_fails_rather_than_hanging(self, tmp_path) -> None:
+        """O_NONBLOCK is the difference between a failure and a hung cron job."""
+        path = tmp_path / "results.log"
+        os.mkfifo(path)
+
+        with pytest.raises(SourceError, match="not a regular file"):
+            self._source(path).collect()
+
+    def test_a_missing_results_log_still_says_so(self, tmp_path) -> None:
+        with pytest.raises(SourceError, match="not found"):
+            self._source(tmp_path / "absent.log").collect()
+
+    def test_a_real_log_is_still_read(self, tmp_path) -> None:
+        path = tmp_path / "results.log"
+        record = {
+            "name": "fleetdrift_macos_apps",
+            "hostIdentifier": "h1",
+            "unixTime": 100,
+            "snapshot": [{"name": "Slack.app", "version": "4.0"}],
+            "decorations": {"hostname": "h1.corp", "platform": "darwin"},
+        }
+        path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        inventory = self._source(path).collect()
+        assert inventory.host_count == 1
+
+
+class TestOperatorSuppliedFilesAreOpenedThroughADescriptor:
+    """The catalog and the decision file are read from the checked-out repo."""
+
+    def test_a_symlinked_catalog_is_refused(self, tmp_path) -> None:
+        from fleetdrift.rules.catalog import load_catalog
+
+        target = tmp_path / "elsewhere.yml"
+        target.write_text("entries: []\n", encoding="utf-8")
+        link = tmp_path / "catalog.yml"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError, match="cannot open catalog file"):
+            load_catalog(link)
+
+    def test_a_symlinked_decision_file_is_refused(self, tmp_path) -> None:
+        target = tmp_path / "elsewhere.yml"
+        target.write_text("version: 1\ndecisions: []\n", encoding="utf-8")
+        link = tmp_path / "decisions.yml"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError, match="cannot open decision file"):
+            DecisionStore(link).load()
+
+    def test_a_missing_decision_file_is_still_just_an_empty_store(self, tmp_path) -> None:
+        assert DecisionStore(tmp_path / "absent.yml").load() == {}
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs only")
+    def test_a_fifo_decision_file_fails_rather_than_hanging(self, tmp_path) -> None:
+        path = tmp_path / "decisions.yml"
+        os.mkfifo(path)
+        with pytest.raises(ValidationError, match="not a regular file"):
+            DecisionStore(path).load()
+
+
+class TestStateDirectoryChain:
+    """O_NOFOLLOW covers the final component only."""
+
+    def test_a_symlinked_state_directory_is_refused(self, tmp_path) -> None:
+        elsewhere = tmp_path / "attacker"
+        elsewhere.mkdir()
+        link = tmp_path / ".fleetdrift"
+        link.symlink_to(elsewhere)
+
+        with pytest.raises(StateError, match="is a symlink"):
+            SnapshotStore(link / "fleetdrift.db", scope="p").save(Inventory(collected_at="t", source="x"))
+        assert list(elsewhere.iterdir()) == []
+
+
+class TestReportPathIsNotFollowed:
+    """A report is written into a shared artefact directory on a build agent."""
+
+    def _report(self) -> ScanReport:
+        return ScanReport(started_at="t", finished_at="t", tool_version="0", source="test")
+
+    def test_the_report_is_written_owner_only(self, tmp_path) -> None:
+        from fleetdrift.cli import _write_report
+
+        path = tmp_path / "report.json"
+        _write_report(self._report(), str(path), "json")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_a_permissive_file_from_a_previous_run_is_tightened(self, tmp_path) -> None:
+        from fleetdrift.cli import _write_report
+
+        path = tmp_path / "report.md"
+        path.write_text("stale", encoding="utf-8")
+        os.chmod(path, 0o644)
+        _write_report(self._report(), str(path), "markdown")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_a_symlinked_output_path_is_refused(self, tmp_path) -> None:
+        from fleetdrift.cli import _write_report
+
+        target = tmp_path / "victim.txt"
+        target.write_text("original", encoding="utf-8")
+        os.chmod(target, 0o644)
+        link = tmp_path / "report.md"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError, match="cannot write report"):
+            _write_report(self._report(), str(link), "markdown")
+
+        assert target.read_text(encoding="utf-8") == "original"
+        # The chmod is the second half of the attack: it locks the owner out.
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+class TestEvidenceIsScrubbedAtSerialisation:
+    """Evidence carries osquery row fields and an operator's catalog entries."""
+
+    def _finding(self, evidence: dict) -> Finding:
+        return Finding(
+            host_display="h1",
+            host_id="h1",
+            software="Thing",
+            version="1.0",
+            kind=FindingKind.POSTURE,
+            severity=Severity.LOW,
+            category=RiskCategory.UNKNOWN,
+            title="t",
+            detail="d",
+            evidence=evidence,
+        )
+
+    def test_a_credential_shaped_key_is_redacted(self) -> None:
+        from fleetdrift.validation import REDACTED
+
+        out = self._finding({"install_path": "/opt/x", "license_key": "ABCD-1234-EFGH"}).to_dict()
+        assert out["evidence"]["license_key"] == REDACTED
+        assert out["evidence"]["install_path"] == "/opt/x"
+        assert "ABCD-1234-EFGH" not in json.dumps(out)
+
+    def test_a_huge_host_list_is_bounded(self) -> None:
+        out = self._finding({"hosts": [f"h{i}" for i in range(500)]}).to_dict()
+        assert len(out["evidence"]["hosts"]) == 51
+        assert out["evidence"]["hosts"][-1].endswith("more")
+
+
+class TestSerialisedReportIsBounded:
+    def test_findings_are_capped_and_the_total_stays_whole(self) -> None:
+        from fleetdrift.models import MAX_SERIALISED_FINDINGS as cap
+
+        findings = [
+            Finding(
+                host_display="h1",
+                host_id="h1",
+                software=f"pkg{i}",
+                version="1",
+                kind=FindingKind.POSTURE,
+                severity=Severity.LOW,
+                category=RiskCategory.UNKNOWN,
+                title="t",
+                detail="d",
+            )
+            for i in range(cap + 4)
+        ]
+        out = ScanReport(
+            started_at="t", finished_at="t", tool_version="0", source="test", findings=findings
+        ).to_dict()
+        assert len(out["findings"]) == cap
+        assert out["findings_total"] == cap + 4
+        assert out["findings_truncated"] is True
+
+
+class TestADevicePathIsStillWritable:
+    """`-o /dev/null` is a reasonable thing to write in a pipeline that only
+    wants the exit code. The 0600 is for a real file; chmod-ing a character
+    device is either a permission error or, as root, a machine-wide change."""
+
+    def test_writing_to_dev_null_neither_fails_nor_chmods_it(self) -> None:
+        from fleetdrift.cli import _write_report
+
+        before = stat.S_IMODE(os.stat("/dev/null").st_mode)
+        _write_report(
+            ScanReport(started_at="t", finished_at="t", tool_version="0", source="test"),
+            "/dev/null",
+            "json",
+        )
+        assert stat.S_IMODE(os.stat("/dev/null").st_mode) == before

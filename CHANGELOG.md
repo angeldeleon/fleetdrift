@@ -6,7 +6,58 @@ Notable changes to fleetdrift, newest first. Format follows
 
 ## [Unreleased]
 
+A cross-tool consistency pass, measuring this repository against the controls
+its siblings implement rather than against its own documentation. Most of what
+follows was never claimed here, which is exactly why nothing caught it.
+
 ### Fixed
+
+- **Every file this tool opens now refuses a symlink and a named pipe.** The
+  state database and the salt were opened this way; the report, the osquery
+  results log, an extra catalog and the decision file were not. The results log
+  in particular lives in a drop directory shared with whatever ships it, and
+  `is_file()` followed by `open()` checked one name and read another — so a link
+  planted there aimed the reader at any file the scanning account could open,
+  and a FIFO there hung every scheduled scan with no timeout and nothing in the
+  log. All of them now open through a descriptor with `O_NOFOLLOW` and
+  `O_NONBLOCK`, take the file type and size from `fstat` on that descriptor, and
+  restore blocking mode only once the descriptor is known to be a regular file.
+- **Reports are written `0600`, through a descriptor that will not follow a
+  link.** A report lists which machines run what, and under
+  `privacy.mode: identified` it names them; it was being written at the process
+  umask, to whatever the path resolved to.
+- **The state database's parent chain is validated, not just its final
+  component.** `O_NOFOLLOW` applies to the last component only and
+  `mkdir(exist_ok=True)` accepts a pre-existing symlink-to-directory, so a
+  planted `.fleetdrift -> /tmp/attacker` redirected the whole inventory with
+  every guard on the file itself still passing. The default state path is
+  relative, which puts it inside the checked-out repository on CI.
+- **A host that reported nothing is no longer read as a host that uninstalled
+  everything.** The diff guarded the empty *baseline* and not the empty
+  *current* snapshot, so a re-enrolled machine that had not yet reported
+  inventory would have produced a removal finding for every flagged package on
+  it — a security report announcing remediation that did not happen. Both
+  collectors already drop such a host; the diff no longer depends on them
+  continuing to.
+- **Finding evidence is redacted and bounded where the finding is serialised**,
+  rather than at each of the four sinks that render it. An osquery row is
+  whatever the table returned and an operator's catalog entry can name any
+  field, so a value under a key like `license_key` reached the JSON report and
+  the webhook; it now keeps its name and loses its value in every format,
+  including the next one somebody adds.
+- **The JSON report caps its findings and its collection notes**, the way it
+  already capped the unclassified-software list, with the totals kept whole
+  above the cap so a consumer can tell it is reading a subset.
+- **The decision file's temporary sibling is chmodded through its descriptor**
+  rather than by name.
+
+### Added
+
+- CI invariants asserting that every `os.open` in the tree carries
+  `O_NOFOLLOW`, that every read carries `O_NONBLOCK`, that no module reaches
+  around the guarded reader with `read_text`/`write_text`, that an empty
+  collection produces no uninstall findings, and that nothing credential-shaped
+  survives into any of the three report formats.
 
 - **Software whose name is only punctuation, symbols or emoji is no longer
   invisible.** `normalize_software_name` reduced `+++` or a single emoji to the
