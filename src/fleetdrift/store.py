@@ -99,9 +99,44 @@ class SnapshotStore:
 
     # ------------------------------------------------------------------
 
+    def _assert_safe_parent(self) -> None:
+        """Refuse a state path whose directory chain contains a symlink.
+
+        ``O_NOFOLLOW`` applies to the final component only, and
+        ``Path.mkdir(exist_ok=True)`` happily accepts a pre-existing
+        symlink-to-directory because ``is_dir()`` follows links. The default
+        ``state_path`` is relative, so in CI it lands inside the checked-out
+        repository, and a planted ``.fleetdrift -> /tmp/attacker`` redirected the
+        whole database with every guard on the final component still passing --
+        that database being a complete software inventory of every managed
+        endpoint.
+        """
+        parent = self.path.parent
+        resolved = parent.resolve()
+        walker = parent
+        seen: set[Path] = set()
+        while walker not in seen:
+            seen.add(walker)
+            if walker.is_symlink():
+                raise StateError(
+                    f"{walker} is a symlink; refusing to write the state database through "
+                    "it. The database is a software inventory of every managed endpoint, "
+                    "so where it lands is a security decision."
+                )
+            if walker.parent == walker:
+                break
+            walker = walker.parent
+        if parent.exists() and parent.resolve() != resolved:
+            raise StateError(f"{parent} changed while being validated; refusing to continue")
+
     def _connect(self) -> sqlite3.Connection:
         try:
+            self._assert_safe_parent()
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Re-checked after mkdir: the directory may not have existed at the
+            # first check, and creating it is exactly the moment somebody racing
+            # this would substitute a link.
+            self._assert_safe_parent()
             # Create the file ourselves at 0600 before sqlite touches it.
             # sqlite3.connect() creates at 0644 and chmod-ing afterwards leaves
             # a window in which another local process can open a complete

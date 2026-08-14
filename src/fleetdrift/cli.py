@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -289,7 +291,36 @@ def _write_report(report: ScanReport, output: str, fmt: str) -> None:
 
     path = Path(output).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    # 0600, for the same reason the state database is: a report from this tool
+    # is a list of which machines run what, and under `privacy.mode: identified`
+    # it names them. Inheriting the process umask would leave that
+    # world-readable on a shared host or a multi-tenant runner.
+    #
+    # O_NOFOLLOW for the same reason the state database has it. Reports are
+    # usually written into a shared artefact directory on a build agent, and a
+    # symlink planted at the path would otherwise redirect that inventory to a
+    # file the attacker can read — and then have the chmod below tighten *their*
+    # target, which is a working denial of service against anything the job's
+    # account owns. Failing is the right answer: a report going somewhere
+    # unexpected is not a thing to recover from quietly.
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        # ELOOP lands here: the path is a symlink and we refused to follow it.
+        raise ValidationError(f"cannot write report to {path}: {exc}") from exc
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # O_CREAT leaves the mode of an already-existing file alone, and a
+        # report path is usually reused run after run, so set it explicitly
+        # too — through the descriptor, never the path.
+        #
+        # Only for a regular file. `-o /dev/null` is a reasonable thing to write
+        # in a pipeline that only wants the exit code, and chmod-ing a character
+        # device is either a permission error that breaks it or, running as
+        # root, a machine-wide change to /dev/null. There is nothing to protect
+        # on a device or a pipe anyway: no file is left behind to read.
+        if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            os.fchmod(handle.fileno(), 0o600)
+        handle.write(rendered)
     log.info("wrote %s report to %s", fmt, path)
 
 

@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -45,19 +47,55 @@ class ResultLogSource:
         self.config = config
         self.max_hosts = max_hosts
 
+    def _open(self, path: Path) -> int:
+        """Open the results log through a descriptor, and check what it is.
+
+        ``O_NOFOLLOW`` because a results log lives in a drop directory shared
+        with whatever ships it — often world-writable, because the shipper runs
+        as somebody else — and following a symlink out of it would let that
+        process aim this reader at any file the scanning account can open, whose
+        contents then land in a report and, with the AI layer enabled, in an API
+        request. ELOOP surfaces as a refusal.
+
+        ``O_NONBLOCK`` because a FIFO at the path blocks *inside* ``os.open``
+        until a writer appears, so the regular-file check below never runs: a
+        named pipe left where the log should be hangs every scheduled scan
+        indefinitely rather than failing it, and a monitor that stops running
+        quietly is the failure mode this tool exists to prevent. Cleared once
+        the descriptor is known to be a regular file, where a short read would
+        be a liability rather than a guard.
+
+        ``is_file()`` followed by ``open()`` was two lookups of the same name,
+        and the size came from the second one; both now come from ``fstat`` on
+        the descriptor that is actually read.
+        """
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError as exc:
+            raise SourceError(f"results log not found: {path}") from exc
+        except OSError as exc:
+            # ELOOP lands here: the path is a symlink and we refused to follow it.
+            raise SourceError(f"cannot open results log {path}: {exc}") from exc
+
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SourceError(f"results log {path} is not a regular file; refusing to read it")
+            if info.st_size > self.config.max_bytes:
+                raise SourceError(
+                    f"results log is {info.st_size} bytes, above the configured max_bytes "
+                    f"({self.config.max_bytes}). Rotate the log or raise the limit deliberately."
+                )
+            os.set_blocking(fd, True)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
     def collect(self) -> Inventory:
         inventory = Inventory(collected_at=Inventory.now_iso(), source=self.name)
         path = Path(self.config.path).expanduser()
-
-        if not path.is_file():
-            raise SourceError(f"results log not found: {path}")
-
-        size = path.stat().st_size
-        if size > self.config.max_bytes:
-            raise SourceError(
-                f"results log is {size} bytes, above the configured max_bytes "
-                f"({self.config.max_bytes}). Rotate the log or raise the limit deliberately."
-            )
+        fd = self._open(path)
 
         truncated_hosts = 0
         empty_hosts = 0
@@ -69,7 +107,9 @@ class ResultLogSource:
         lines_read = 0
 
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
+            # os.fdopen takes ownership of the descriptor, so the close on the
+            # way out of the `with` is the only one.
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
                 for raw_line in handle:
                     lines_read += 1
                     if lines_read > _MAX_LINES:

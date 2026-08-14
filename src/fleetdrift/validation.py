@@ -26,9 +26,14 @@ Three threats drive the design:
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
+import stat
 import unicodedata
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -37,9 +42,12 @@ __all__ = [
     "assert_http_url",
     "resolve_public_ips",
     "is_public_address",
+    "read_text_file",
     "safe_text",
+    "scrub_evidence",
     "normalize_software_name",
     "validate_env_var_name",
+    "REDACTED",
 ]
 
 
@@ -130,6 +138,128 @@ def normalize_software_name(value: object) -> str:
     # Nothing but separators survived. The version and decoration strips above
     # have already run, so "+++ 1.0" and "+++ 2.0" still collapse to one key.
     return " ".join(text.split())
+
+
+REDACTED = "<redacted>"
+
+# Keys whose value must never be persisted, rendered or forwarded. Matched as a
+# substring of the lowercased key, so `licenseKey` and `install_token` are both
+# caught. Deliberately broad: the cost of redacting a harmless field is a less
+# informative evidence blob, and the cost of missing one is a credential in a
+# Slack channel. An osquery row is a dictionary of whatever the table returned,
+# and an operator's extra catalog entry can name any field it likes.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(secret|password|passwd|private[_-]?key|api[_-]?key|apikey|\bkey\b|keyvalue|"
+    r"token|bearer|authorization|cookie|credential|licen[cs]e)"
+)
+
+# Evidence is serialised into a JSON report and a webhook payload. A fleet with
+# thousands of hosts must not be able to produce either an unusable report or a
+# request the receiver drops.
+_MAX_EVIDENCE_KEYS = 40
+_MAX_EVIDENCE_ITEMS = 50
+_MAX_EVIDENCE_DEPTH = 4
+_READ_CHUNK = 1024 * 1024
+
+
+def scrub_evidence(raw: Any, *, _depth: int = 0) -> Any:
+    """Strip credential-shaped values from a structure at construction time.
+
+    Redaction belongs here rather than in the renderers. There are four output
+    sinks today — Markdown, JSON, HTML, webhook — and the fifth one somebody adds
+    will not remember to redact. A finding that never *holds* a secret cannot
+    leak one however it is rendered, so the value is dropped when the finding is
+    serialised and the field name is kept, because "this package carries a field
+    called `license_key`" is the fact worth reporting and the value never is.
+
+    Also bounds the structure, for the reason given on the caps above.
+    """
+    if _depth > _MAX_EVIDENCE_DEPTH:
+        return "<truncated>"
+
+    if isinstance(raw, Mapping):
+        out: dict[str, Any] = {}
+        for index, (key, value) in enumerate(raw.items()):
+            if index >= _MAX_EVIDENCE_KEYS:
+                out["_truncated"] = f"{len(raw) - _MAX_EVIDENCE_KEYS} further key(s) omitted"
+                break
+            name = safe_text(key, limit=80)
+            if _SECRET_KEY_RE.search(name):
+                out[name] = REDACTED
+                continue
+            out[name] = scrub_evidence(value, _depth=_depth + 1)
+        return out
+
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+        scrubbed = [scrub_evidence(item, _depth=_depth + 1) for item in items[:_MAX_EVIDENCE_ITEMS]]
+        if len(items) > _MAX_EVIDENCE_ITEMS:
+            scrubbed.append(f"…and {len(items) - _MAX_EVIDENCE_ITEMS} more")
+        return scrubbed
+
+    if isinstance(raw, bool) or raw is None:
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw
+    return safe_text(raw, limit=400)
+
+
+def read_text_file(path: str | Path, *, max_bytes: int, what: str = "file") -> str:
+    """Read one file through a descriptor, refusing anything that is not a regular file.
+
+    Used for the operator-supplied files this tool reads — the extra catalog and
+    the decision file — and written this way rather than as ``Path.read_text()``
+    for three reasons.
+
+    * ``O_NOFOLLOW``, because both of those paths come from the config and are
+      usually inside the repository the scan runs from. Following a symlink out
+      of it would let whoever can write that checkout aim this reader at any file
+      the scanning account can open, and the contents come back out in a report.
+      ELOOP surfaces as a refusal.
+    * ``O_NONBLOCK``, because a FIFO at the path blocks inside ``os.open``,
+      before the regular-file check can refuse it, and would hang the run with no
+      timeout and nothing in the log. Cleared once the descriptor is known to be
+      a regular file.
+    * The size is checked from ``fstat`` before reading and again while reading:
+      the first tells the truth about a regular file, the second catches one that
+      grows underneath us. ``stat()`` followed by ``open()`` checked one name and
+      read another.
+    """
+    file_path = Path(path).expanduser()
+    try:
+        fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError as exc:
+        raise ValidationError(f"{what} not found: {file_path}") from exc
+    except OSError as exc:
+        # ELOOP lands here: the path is a symlink and we refused to follow it.
+        raise ValidationError(f"cannot open {what} {file_path}: {exc}") from exc
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValidationError(f"{what} {file_path} is not a regular file; refusing to read it")
+        if info.st_size > max_bytes:
+            raise ValidationError(
+                f"{what} {file_path} is {info.st_size} bytes, above the {max_bytes} byte limit"
+            )
+        os.set_blocking(fd, True)
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValidationError(f"{what} {file_path} exceeds the {max_bytes} byte limit while reading")
+            chunks.append(chunk)
+    except OSError as exc:
+        raise ValidationError(f"cannot read {what} {file_path}: {exc}") from exc
+    finally:
+        os.close(fd)
+
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 def validate_env_var_name(name: str, *, where: str) -> str:
